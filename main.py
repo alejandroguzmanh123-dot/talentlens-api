@@ -103,7 +103,6 @@ def detect_platform(url: str) -> Optional[str]:
 
 
 async def upload_to_supabase(image_bytes: bytes, filename: str) -> str:
-    """Upload image to Supabase Storage and return public URL."""
     upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -123,7 +122,6 @@ async def upload_to_supabase(image_bytes: bytes, filename: str) -> str:
 
 
 async def delete_from_supabase(filename: str):
-    """Delete image from Supabase Storage (best-effort cleanup)."""
     delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -132,7 +130,7 @@ async def delete_from_supabase(filename: str):
                 headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
             )
     except Exception:
-        pass  # Cleanup failure is non-fatal
+        pass
 
 
 @app.get("/")
@@ -156,17 +154,18 @@ async def search(file: UploadFile = File(...)):
     query_embedding = get_embedding(image_bytes)
     biometric_enabled = query_embedding is not None
 
-    # Upload image to Supabase Storage to get a public URL for SerpAPI
+    # Upload to Supabase Storage for a public URL
     filename = f"search-{uuid.uuid4()}.jpg"
     image_url = await upload_to_supabase(image_bytes, filename)
-    print(f"Uploaded image to Supabase: {image_url}")
+    print(f"Uploaded to Supabase: {image_url}")
 
     try:
+        # Yandex Reverse Image: much better for identity/face search than Google Lens
         async with httpx.AsyncClient(timeout=30) as client:
             serp_resp = await client.get(
                 "https://serpapi.com/search.json",
                 params={
-                    "engine": "google_lens",
+                    "engine": "yandex_reverse_image",
                     "api_key": SERP_API_KEY,
                     "url": image_url,
                 },
@@ -180,16 +179,18 @@ async def search(file: UploadFile = File(...)):
                 )
             serp_data = serp_resp.json()
     finally:
-        # Always clean up the temp image from storage
         await delete_from_supabase(filename)
 
-    visual_matches = serp_data.get("visual_matches", [])
-    results = []
+    # Yandex returns image_results with link + thumbnail.link
+    image_results = serp_data.get("image_results", [])
+    print(f"Yandex returned {len(image_results)} results")
 
+    results = []
     async with httpx.AsyncClient(timeout=15) as client:
-        for match in visual_matches[:40]:
+        for match in image_results[:60]:
             source_url = match.get("link", "")
-            match_image_url = match.get("thumbnail", match.get("image", ""))
+            thumbnail_obj = match.get("thumbnail", {})
+            match_image_url = thumbnail_obj.get("link", "") if isinstance(thumbnail_obj, dict) else ""
             platform = detect_platform(source_url)
             if not platform or not match_image_url:
                 continue
@@ -201,7 +202,10 @@ async def search(file: UploadFile = File(...)):
                         result_embedding = get_embedding(img_resp.content)
                         if result_embedding is not None:
                             similarity = cosine_similarity(query_embedding, result_embedding)
-                            match_pct = int(max(0, min(100, similarity * 100)))
+                            # Require high similarity for same-person match (>0.35 on normed embeddings)
+                            if similarity < 0.35:
+                                continue
+                            match_pct = int(min(99, 50 + similarity * 50))
                         else:
                             continue
                     else:
@@ -212,13 +216,12 @@ async def search(file: UploadFile = File(...)):
                 position = match.get("position", 30)
                 match_pct = max(65, int(98 - (position * 1.5)))
 
-            if match_pct >= 65:
-                results.append(SearchResult(
-                    platform=platform,
-                    imageUrl=match_image_url,
-                    profileUrl=source_url,
-                    matchPercentage=match_pct,
-                ))
+            results.append(SearchResult(
+                platform=platform,
+                imageUrl=match_image_url,
+                profileUrl=source_url,
+                matchPercentage=match_pct,
+            ))
 
     seen = set()
     unique_results = []
