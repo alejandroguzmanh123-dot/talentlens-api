@@ -121,10 +121,10 @@ async def search(file: UploadFile = File(...)):
         serp_resp = await client.post(
             "https://serpapi.com/search",
             params={"engine": "google_lens", "api_key": SERP_API_KEY},
-            files={"image": (file.filename, image_bytes, file.content_type)},
+            files={"image": ("photo.jpg", image_bytes, "image/jpeg")},
         )
         if serp_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="SerpAPI error: " + serp_resp.text)
+            raise HTTPException(status_code=502, detail=f"SerpAPI error {serp_resp.status_code}: {serp_resp.text[:300] if serp_resp.text else 'empty response'}")
         serp_data = serp_resp.json()
 
     visual_matches = serp_data.get("visual_matches", [])
