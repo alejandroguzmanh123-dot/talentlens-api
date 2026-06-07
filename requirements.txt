@@ -6,4 +6,4 @@ pydantic==2.7.1
 numpy==1.26.4
 opencv-python-headless==4.9.0.80
 insightface==0.7.3
-onnxruntime==1.18.0
+onnxruntime==1.20.0
