@@ -117,11 +117,17 @@ async def search(file: UploadFile = File(...)):
     query_embedding = get_embedding(image_bytes)
     biometric_enabled = query_embedding is not None
 
+    import base64
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
     async with httpx.AsyncClient(timeout=30) as client:
         serp_resp = await client.post(
-            "https://serpapi.com/search",
-            params={"engine": "google_lens", "api_key": SERP_API_KEY},
-            files={"image": ("photo.jpg", image_bytes, "image/jpeg")},
+            "https://serpapi.com/search.json",
+            data={
+                "engine": "google_lens",
+                "api_key": SERP_API_KEY,
+                "image_content": image_b64,
+            },
         )
         if serp_resp.status_code != 200:
             raise HTTPException(status_code=502, detail=f"SerpAPI error {serp_resp.status_code}: {serp_resp.text[:300] if serp_resp.text else 'empty response'}")
