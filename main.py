@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
 import threading
+import uuid
 from typing import List, Optional
 from pydantic import BaseModel
 
@@ -16,6 +17,9 @@ app.add_middleware(
 )
 
 SERP_API_KEY = os.environ.get("SERP_API_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = "photos"
 
 PLATFORM_MAP = {
     "instagram.com": "instagram",
@@ -67,7 +71,7 @@ def get_embedding(image_bytes: bytes):
         faces = face_app.get(img)
         if not faces:
             return None
-        largest = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+        largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
         return largest.normed_embedding
     except Exception as e:
         print(f"Embedding error: {e}")
@@ -98,6 +102,39 @@ def detect_platform(url: str) -> Optional[str]:
     return None
 
 
+async def upload_to_supabase(image_bytes: bytes, filename: str) -> str:
+    """Upload image to Supabase Storage and return public URL."""
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            upload_url,
+            content=image_bytes,
+            headers={
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "image/jpeg",
+            },
+        )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Supabase upload failed ({resp.status_code}): {resp.text[:200]}",
+            )
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{filename}"
+
+
+async def delete_from_supabase(filename: str):
+    """Delete image from Supabase Storage (best-effort cleanup)."""
+    delete_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{filename}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.delete(
+                delete_url,
+                headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
+            )
+    except Exception:
+        pass  # Cleanup failure is non-fatal
+
+
 @app.get("/")
 def root():
     return {"status": "ok", "biometric": face_app is not None, "loading": face_app_loading}
@@ -112,26 +149,39 @@ def health():
 async def search(file: UploadFile = File(...)):
     if not SERP_API_KEY:
         raise HTTPException(status_code=500, detail="SERP_API_KEY not configured")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL or SUPABASE_SERVICE_KEY not configured")
 
     image_bytes = await file.read()
     query_embedding = get_embedding(image_bytes)
     biometric_enabled = query_embedding is not None
 
-    import base64
-    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    # Upload image to Supabase Storage to get a public URL for SerpAPI
+    filename = f"search-{uuid.uuid4()}.jpg"
+    image_url = await upload_to_supabase(image_bytes, filename)
+    print(f"Uploaded image to Supabase: {image_url}")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        serp_resp = await client.post(
-            "https://serpapi.com/search.json",
-            data={
-                "engine": "google_lens",
-                "api_key": SERP_API_KEY,
-                "image_content": image_b64,
-            },
-        )
-        if serp_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"SerpAPI error {serp_resp.status_code}: {serp_resp.text[:300] if serp_resp.text else 'empty response'}")
-        serp_data = serp_resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            serp_resp = await client.get(
+                "https://serpapi.com/search.json",
+                params={
+                    "engine": "google_lens",
+                    "api_key": SERP_API_KEY,
+                    "url": image_url,
+                },
+            )
+            if serp_resp.status_code != 200:
+                error_body = serp_resp.text[:500] if serp_resp.text else "empty response"
+                print(f"SerpAPI error: status={serp_resp.status_code}, body={error_body}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"SerpAPI error {serp_resp.status_code}: {error_body}",
+                )
+            serp_data = serp_resp.json()
+    finally:
+        # Always clean up the temp image from storage
+        await delete_from_supabase(filename)
 
     visual_matches = serp_data.get("visual_matches", [])
     results = []
@@ -139,14 +189,14 @@ async def search(file: UploadFile = File(...)):
     async with httpx.AsyncClient(timeout=15) as client:
         for match in visual_matches[:40]:
             source_url = match.get("link", "")
-            image_url = match.get("thumbnail", match.get("image", ""))
+            match_image_url = match.get("thumbnail", match.get("image", ""))
             platform = detect_platform(source_url)
-            if not platform or not image_url:
+            if not platform or not match_image_url:
                 continue
 
             if biometric_enabled:
                 try:
-                    img_resp = await client.get(image_url, follow_redirects=True)
+                    img_resp = await client.get(match_image_url, follow_redirects=True)
                     if img_resp.status_code == 200:
                         result_embedding = get_embedding(img_resp.content)
                         if result_embedding is not None:
@@ -165,7 +215,7 @@ async def search(file: UploadFile = File(...)):
             if match_pct >= 65:
                 results.append(SearchResult(
                     platform=platform,
-                    imageUrl=image_url,
+                    imageUrl=match_image_url,
                     profileUrl=source_url,
                     matchPercentage=match_pct,
                 ))
