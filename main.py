@@ -164,7 +164,7 @@ async def search(file: UploadFile = File(...)):
         if not url or url in seen:
             continue
 
-        if score < 50:
+        if score < 75:
             continue
 
         seen.add(url)
